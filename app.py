@@ -1,31 +1,148 @@
 import streamlit as st
 from google import genai
 from google.genai import types
-import json
+import sqlite3
 import os
 from datetime import datetime
 
+# ================= PAGE CONFIG =================
 st.set_page_config(page_title="Gemini Chat App", page_icon="🤖")
 st.title("🤖 Gemini Chat App with Image Reading")
 
-CHAT_FILE = "chat_history.json"
+# ================= SETTINGS =================
+MODEL_NAME = "gemini-2.5-flash-lite"
+MAX_MEMORY_MESSAGES = 10
+MAX_OUTPUT_TOKENS = 600
+
+# ================= DATABASE SETUP =================
+os.makedirs("database", exist_ok=True)
+DB_FILE = "database/chat_app.db"
+
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS chats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(chat_id) REFERENCES chats(id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def create_chat(title):
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute(
+        "INSERT INTO chats (title, created_at) VALUES (?, ?)",
+        (title, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+
+    chat_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    return chat_id
+
+
+def save_message(chat_id, role, content):
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute(
+        """
+        INSERT INTO messages (chat_id, role, content, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            chat_id,
+            role,
+            content,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_all_chats():
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT id, title, created_at
+        FROM chats
+        ORDER BY id DESC
+    """)
+
+    chats = c.fetchall()
+    conn.close()
+
+    return chats
+
+
+def get_chat_messages(chat_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute(
+        """
+        SELECT role, content
+        FROM messages
+        WHERE chat_id = ?
+        ORDER BY id ASC
+        """,
+        (chat_id,)
+    )
+
+    messages = [
+        {
+            "role": row["role"],
+            "content": row["content"]
+        }
+        for row in c.fetchall()
+    ]
+
+    conn.close()
+
+    return messages
+
+
+init_db()
 
 # ================= API KEY =================
 st.sidebar.header("🔑 API Settings")
 
 user_api_key = st.sidebar.text_input(
-    "Enter Gemini API Key optional",
+    "Enter Gemini API Key",
     type="password"
 )
 
-api_key = user_api_key if user_api_key else st.secrets.get("GEMINI_API_KEY", "")
-
-# ================= LOAD SAVED CHATS =================
-if os.path.exists(CHAT_FILE):
-    with open(CHAT_FILE, "r", encoding="utf-8") as f:
-        saved_chats = json.load(f)
-else:
-    saved_chats = {}
+api_key = user_api_key.strip()
 
 # ================= SESSION STATE =================
 if "messages" not in st.session_state:
@@ -33,20 +150,6 @@ if "messages" not in st.session_state:
 
 if "current_chat" not in st.session_state:
     st.session_state.current_chat = None
-
-# ================= SAVE CHAT FUNCTION =================
-def save_chat():
-    if st.session_state.messages:
-        chat_id = st.session_state.current_chat
-
-        if not chat_id:
-            chat_id = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            st.session_state.current_chat = chat_id
-
-        saved_chats[chat_id] = st.session_state.messages
-
-        with open(CHAT_FILE, "w", encoding="utf-8") as f:
-            json.dump(saved_chats, f, indent=2)
 
 # ================= SIDEBAR CHATS =================
 st.sidebar.header("💬 Your Chats")
@@ -56,10 +159,18 @@ if st.sidebar.button("➕ New Chat"):
     st.session_state.current_chat = None
     st.rerun()
 
-for chat_id in saved_chats.keys():
-    if st.sidebar.button(chat_id):
-        st.session_state.messages = saved_chats[chat_id]
+all_chats = get_all_chats()
+
+for chat in all_chats:
+    chat_id = chat["id"]
+    title = chat["title"]
+    created_at = chat["created_at"]
+
+    button_label = f"{title} | {created_at}"
+
+    if st.sidebar.button(button_label, key=f"chat_{chat_id}"):
         st.session_state.current_chat = chat_id
+        st.session_state.messages = get_chat_messages(chat_id)
         st.rerun()
 
 # ================= IMAGE UPLOAD =================
@@ -71,7 +182,11 @@ uploaded_image = st.sidebar.file_uploader(
 )
 
 if uploaded_image:
-    st.sidebar.image(uploaded_image, caption="Uploaded Image", use_container_width=True)
+    st.sidebar.image(
+        uploaded_image,
+        caption="Uploaded Image",
+        use_container_width=True
+    )
 
 # ================= DISPLAY CHAT =================
 for msg in st.session_state.messages:
@@ -83,62 +198,126 @@ user_prompt = st.chat_input("Ask anything about text or uploaded image...")
 
 if user_prompt:
     if not api_key:
-        st.error("Please provide Gemini API key.")
+        st.error("Please enter your Gemini API key in the sidebar.")
         st.stop()
 
-    st.session_state.messages.append({
+    # Create new chat in database if this is a new conversation
+    if st.session_state.current_chat is None:
+        chat_title = user_prompt[:40]
+
+        if len(user_prompt) > 40:
+            chat_title += "..."
+
+        st.session_state.current_chat = create_chat(chat_title)
+
+    # Save user message in session
+    user_message = {
         "role": "user",
         "content": user_prompt
-    })
+    }
 
+    st.session_state.messages.append(user_message)
+
+    # Save user message in database
+    save_message(
+        st.session_state.current_chat,
+        "user",
+        user_prompt
+    )
+
+    # Display user message
     with st.chat_message("user"):
         st.write(user_prompt)
 
-    try:
-        client = genai.Client(api_key=api_key)
+    # Create Gemini client
+    client = genai.Client(api_key=api_key)
 
-        # Image + text mode
-        if uploaded_image:
-            image_bytes = uploaded_image.getvalue()
+    # Assistant response box
+    with st.chat_message("assistant"):
+        response_box = st.empty()
+        response_box.markdown("🤖 **Thinking...**")
 
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
+        answer = ""
+
+        try:
+            prompt_lower = user_prompt.lower()
+
+            use_image = uploaded_image and any(
+                word in prompt_lower
+                for word in [
+                    "image",
+                    "photo",
+                    "picture",
+                    "see",
+                    "look",
+                    "describe",
+                    "read",
+                    "scan",
+                    "analyze"
+                ]
+            )
+
+            # ================= IMAGE + TEXT MODE =================
+            if use_image:
+                image_bytes = uploaded_image.getvalue()
+
+                contents = [
                     types.Part.from_bytes(
                         data=image_bytes,
                         mime_type=uploaded_image.type
                     ),
                     user_prompt
                 ]
+
+            # ================= TEXT CHAT MODE WITH DATABASE MEMORY =================
+            else:
+                recent_messages = st.session_state.messages[-MAX_MEMORY_MESSAGES:]
+
+                contents = []
+
+                for msg in recent_messages:
+                    role = "user" if msg["role"] == "user" else "model"
+
+                    contents.append({
+                        "role": role,
+                        "parts": [
+                            {
+                                "text": msg["content"]
+                            }
+                        ]
+                    })
+
+            # ================= STREAM RESPONSE LIVE =================
+            stream = client.models.generate_content_stream(
+                model=MODEL_NAME,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    temperature=0.4
+                )
             )
 
-        # Text chat mode with memory
-        else:
-            chat_history = []
+            for chunk in stream:
+                if chunk.text:
+                    answer += chunk.text
+                    response_box.markdown(answer)
 
-            for msg in st.session_state.messages:
-                role = "user" if msg["role"] == "user" else "model"
-                chat_history.append({
-                    "role": role,
-                    "parts": [{"text": msg["content"]}]
-                })
+            if not answer.strip():
+                answer = "No response received."
+                response_box.write(answer)
 
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=chat_history
+            # Save assistant response in session
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer
+            })
+
+            # Save assistant response in database
+            save_message(
+                st.session_state.current_chat,
+                "assistant",
+                answer
             )
 
-        answer = response.text
-
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": answer
-        })
-
-        with st.chat_message("assistant"):
-            st.write(answer)
-
-        save_chat()
-
-    except Exception as e:
-        st.error(f"Error: {e}")
+        except Exception as e:
+            response_box.error(f"Error: {e}")

@@ -2,7 +2,7 @@ import streamlit as st
 from google import genai
 from google.genai import types
 import sqlite3
-import os
+from pathlib import Path
 from datetime import datetime
 
 # ================= PAGE CONFIG =================
@@ -15,8 +15,11 @@ MAX_MEMORY_MESSAGES = 10
 MAX_OUTPUT_TOKENS = 600
 
 # ================= DATABASE SETUP =================
-os.makedirs("database", exist_ok=True)
-DB_FILE = "database/chat_app.db"
+BASE_DIR = Path(__file__).parent
+DB_DIR = BASE_DIR / "database"
+DB_DIR.mkdir(exist_ok=True)
+
+DB_FILE = DB_DIR / "chat_app.db"
 
 
 def get_db_connection():
@@ -138,11 +141,29 @@ init_db()
 st.sidebar.header("🔑 API Settings")
 
 user_api_key = st.sidebar.text_input(
-    "Enter Gemini API Key",
+    "Enter Gemini API Key optional",
     type="password"
 )
 
-api_key = user_api_key.strip()
+
+def get_secret_api_key():
+    try:
+        return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        return ""
+
+
+secret_api_key = get_secret_api_key()
+
+if user_api_key.strip():
+    api_key = user_api_key.strip()
+else:
+    api_key = secret_api_key.strip()
+
+if api_key:
+    st.sidebar.success("API key loaded")
+else:
+    st.sidebar.warning("Please enter API key or add Streamlit secret")
 
 # ================= SESSION STATE =================
 if "messages" not in st.session_state:
@@ -198,10 +219,10 @@ user_prompt = st.chat_input("Ask anything about text or uploaded image...")
 
 if user_prompt:
     if not api_key:
-        st.error("Please enter your Gemini API key in the sidebar.")
+        st.error("Please enter Gemini API key in the sidebar or add it in Streamlit Secrets.")
         st.stop()
 
-    # Create new chat in database if this is a new conversation
+    # Create new chat if no current chat exists
     if st.session_state.current_chat is None:
         chat_title = user_prompt[:40]
 
@@ -210,7 +231,7 @@ if user_prompt:
 
         st.session_state.current_chat = create_chat(chat_title)
 
-    # Save user message in session
+    # Save user message in session state
     user_message = {
         "role": "user",
         "content": user_prompt
@@ -269,7 +290,7 @@ if user_prompt:
                     user_prompt
                 ]
 
-            # ================= TEXT CHAT MODE WITH DATABASE MEMORY =================
+            # ================= TEXT CHAT MODE WITH MEMORY =================
             else:
                 recent_messages = st.session_state.messages[-MAX_MEMORY_MESSAGES:]
 
@@ -306,13 +327,13 @@ if user_prompt:
                 answer = "No response received."
                 response_box.write(answer)
 
-            # Save assistant response in session
+            # Save assistant message in session state
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": answer
             })
 
-            # Save assistant response in database
+            # Save assistant message in database
             save_message(
                 st.session_state.current_chat,
                 "assistant",
